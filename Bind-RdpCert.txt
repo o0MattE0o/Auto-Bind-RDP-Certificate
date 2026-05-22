@@ -1,0 +1,378 @@
+<#
+.SYNOPSIS
+ Binds the newest valid "RDP Authentication" certificate to RDP (no service restart) and logs to Event Log.
+.DESCRIPTION
+ - Searches LocalMachine\My for certificates issued from the "RDP Authentication" template.
+ - Validates EKUs (Remote Desktop Authentication + Server Authentication), private key, and time validity.
+ - Selects the newest valid certificate and binds it to RDP (Win32_TSGeneralSetting.SSLCertificateSHA1Hash).
+ - Skips restarting TermService (safer for GPO). Notes that the new cert will take effect after next reboot.
+ - Logs outcomes to the Application event log (creates source if missing).
+
+ Added:
+ - Cleanup step: removes ONLY "RDP Authentication" template certs missing required EKUs (Remote Desktop Authentication),
+   without touching the currently bound cert unless another valid replacement exists. Triggers auto-enrollment if needed.
+.PARAMETER TestOnly
+ Perform all checks and display details, but do not bind or change system state.
+.EXAMPLE
+ .\Bind-RdpCert.ps1
+.EXAMPLE
+ .\Bind-RdpCert.ps1 -TestOnly
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$TestOnly
+)
+
+# ---------------------------
+# Config
+# ---------------------------
+$TemplateName = "<Your RDP Template Name>"
+$TemplateExtOid = "1.3.6.1.4.1.311.21.7" # Certificate Template Information
+$EkuExtOid = "2.5.29.37" # EKU extension
+
+# Required EKUs
+$RequiredEkuOids = @(
+    "1.3.6.1.4.1.311.54.1.2" # Remote Desktop Authentication (required)
+)
+# Optional/recommended EKU
+$OptionalEkuOids = @(
+    "1.3.6.1.5.5.7.3.1" # Server Authentication (recommended/commonly present)
+)
+
+# Event log setup
+$EventLogName = "Application"
+$EventSource  = "RDP-CertBind"
+$EvtId_Success = 1001 # Bound successfully (no restart)
+$EvtId_NoMatch = 1002 # No suitable certificate found
+$EvtId_Invalid = 1003 # Candidate invalid (EKU/private key/expired)
+$EvtId_BoundNow = 1004 # Bound and (if you ever re-enable) applied immediately
+$EvtId_Cleanup  = 1010 # Cleanup removed one or more invalid template certs
+
+# ---------------------------
+# Helper: Event logging
+# ---------------------------
+function Write-RdpEvent {
+    param(
+        [int]$Id,
+        [ValidateSet('Information','Warning','Error')] [string]$Type = 'Information',
+        [string]$Message
+    )
+
+	try {
+	    if ($TestOnly) {
+	        Write-Host "[TEST] Would log event: ID=$Id Type=$Type Message='$Message'"
+	        return
+	    }
+	
+	    if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
+	        New-EventLog -LogName $EventLogName -Source $EventSource
+	        Start-Sleep -Seconds 1
+	    }
+	
+	    Write-EventLog -LogName $EventLogName -Source $EventSource -EventId $Id -EntryType $Type -Message $Message
+	}
+
+	catch {
+	    if ($TestOnly) {
+	        Write-Host "[TEST] Would write fallback event log: $Message"
+	    } else {
+	        Write-EventLog -LogName $EventLogName -Source "Windows PowerShell" -EventId $Id -EntryType $Type -Message ("[$EventSource] " + $Message)
+	    }
+	}
+}
+
+# ---------------------------
+# Admin check (only needed if actually binding)
+# ---------------------------
+if (-not $TestOnly) {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Warning "This script must be run elevated to bind the RDP certificate. Try -TestOnly or run as admin."
+        Write-RdpEvent -Id $EvtId_Invalid -Type Error -Message "Binding failed: not running elevated."
+        #exit 5
+    }
+}
+
+# ---------------------------
+# Ensure Auto-Enrollment will replace old/superseded certificates (idempotent)
+# ---------------------------
+if ($TestOnly) {
+    Write-Host "[TEST] Would configure Auto-Enrollment policy (AEPolicy=7)."
+} else {
+    New-Item -Path "HKLM:\Software\Policies\Microsoft\Cryptography\AutoEnrollment" -Force | Out-Null
+    Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Cryptography\AutoEnrollment" -Name "AEPolicy" -Type DWord -Value 7
+}
+
+
+# ---------------------------
+# SAFETY: discover which cert (if any) is currently bound to RDP
+# ---------------------------
+$boundThumb = ""
+try {
+    $ts = Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace "root\cimv2\terminalservices" -Filter "TerminalName='RDP-Tcp'"
+    if ($ts -and $ts.SSLCertificateSHA1Hash) {
+        $boundThumb = ($ts.SSLCertificateSHA1Hash -replace ' ', '').ToUpper()
+    }
+} catch { }
+
+# =======================================================================================
+# CLEANUP (new): Remove only "RDP Authentication" template-issued certs that lack required EKUs
+#                - Scans LocalMachine\My and LocalMachine\RemoteDesktop
+#                - Will not delete the currently bound cert unless another valid replacement exists
+#                - If anything removed, triggers auto-enrollment (certutil -pulse)
+# =======================================================================================
+Write-Host "Running targeted cleanup for non-compliant 'RDP Authentication' template certs..."
+$storesToScan = @("Cert:\LocalMachine\My", "Cert:\LocalMachine\RemoteDesktop")
+$removed = @()
+$now = Get-Date
+
+# Helper to test EKUs
+function Test-HasRequiredEkUs {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
+    $ekuExt = $Cert.Extensions | Where-Object { $_.Oid.Value -eq $EkuExtOid -or $_.Oid.FriendlyName -eq "Enhanced Key Usage" }
+    $ekuOids = @()
+    if ($ekuExt -and $ekuExt.PSObject.Properties.Name -contains 'EnhancedKeyUsages') {
+        $ekuOids = @($ekuExt.EnhancedKeyUsages | ForEach-Object { $_.Value })
+    }
+    # Must include Remote Desktop Authentication; Server Auth is recommended but not required for deletion logic
+    return ($RequiredEkuOids | ForEach-Object { $ekuOids -contains $_ }) -notcontains $false
+}
+
+# Determine if there is at least one OTHER valid RDP template cert we could keep/bind
+function Get-OtherValidRdpTemplateCerts {
+    param([string]$ExcludeThumbprint = "")
+    $all = @(Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
+    foreach ($c in $all) {
+        $tmplExt = $c.Extensions | Where-Object { $_.Oid.Value -eq $TemplateExtOid -or $_.Oid.FriendlyName -eq "Certificate Template Information" }
+        if (-not $tmplExt) { continue }
+        $tmplText = $tmplExt.Format($false)
+        if ($tmplText -notlike "*$TemplateName*") { continue }
+        if ($ExcludeThumbprint -and ($c.Thumbprint -replace ' ','').ToUpper() -eq $ExcludeThumbprint) { continue }
+        # validity + private key + EKUs
+        $hasKey = $false
+        try { $hasKey = [bool]$c.HasPrivateKey } catch { $hasKey = $false }
+        if ($c.NotAfter -le $now -or $c.NotBefore -gt $now) { continue }
+        if (-not $hasKey) { continue }
+        if (-not (Test-HasRequiredEkUs -Cert $c)) { continue }
+        # looks good
+        $c
+    }
+}
+
+foreach ($store in $storesToScan) {
+    $items = @(Get-ChildItem -Path $store -ErrorAction SilentlyContinue)
+    foreach ($cert in $items) {
+        # Only consider certs that were issued from the "RDP Authentication" template
+        $tmplExt = $cert.Extensions | Where-Object { $_.Oid.Value -eq $TemplateExtOid -or $_.Oid.FriendlyName -eq "Certificate Template Information" }
+        if (-not $tmplExt) { continue }
+        $tmplText = $tmplExt.Format($false)
+        if ($tmplText -notlike "*$TemplateName*") { continue }
+
+        $thumb = ($cert.Thumbprint -replace ' ', '').ToUpper()
+        $compliant = Test-HasRequiredEkUs -Cert $cert
+        if ($compliant) { continue } # Only remove non-compliant template certs
+
+        # Safety: If this is the currently bound cert, only remove if another valid replacement exists.
+        if ($thumb -eq $boundThumb) {
+            $alt = @(Get-OtherValidRdpTemplateCerts -ExcludeThumbprint $thumb)
+            if ($alt.Count -eq 0) {
+                Write-Host "Skipping removal of currently-bound non-compliant cert $thumb (no alternate valid cert available)."
+                Write-RdpEvent -Id $EvtId_Invalid -Type Warning -Message "Non-compliant bound RDP template cert $thumb retained (no alternate valid cert found)."
+                continue
+            }
+        }
+
+	# If TestOnly is specified, do NOT remove anything — only log it
+	if ($TestOnly) {
+	    Write-Host "[TEST] Would remove non-compliant cert $thumb from $store (Subject=$($cert.Subject))."
+	    Write-RdpEvent -Id $EvtId_Cleanup -Type Information -Message "[TEST] Would remove non-compliant RDP template cert $thumb from $store."
+	    continue
+	}
+	
+	# Live mode: actually remove the certificate
+	try {
+	    Remove-Item -Path $cert.PSPath -Force
+	    $removed += [pscustomobject]@{
+	        Store     = $store
+	        Thumbprint = $thumb
+	        Subject    = $cert.Subject
+	        NotAfter   = $cert.NotAfter
+	        Reason     = "Missing required EKU(s): Remote Desktop Authentication"
+	    }
+	    Write-Host "Removed non-compliant RDP template cert $thumb from $store (Subject=$($cert.Subject))."
+	}
+	catch {
+	    Write-Warning "Failed to remove $thumb from $store : $($_.Exception.Message)"
+	    Write-RdpEvent -Id $EvtId_Invalid -Type Error -Message "Failed to remove non-compliant RDP template cert $thumb from $store : $($_.Exception.Message)"
+	}
+    }
+}
+
+if ($removed.Count -gt 0) {
+
+    if ($TestOnly) {
+        Write-Host "[TEST] Would trigger auto-enrollment (certutil -pulse)."
+        Write-RdpEvent -Id $EvtId_Cleanup -Type Information -Message "[TEST] Would trigger auto-enrollment."
+    }
+    else {
+        Write-RdpEvent -Id $EvtId_Cleanup -Type Information -Message ("Removed {0} non-compliant 'RDP Authentication' template cert(s)." -f $removed.Count)
+        try { certutil.exe -pulse | Out-Null } catch { }
+        Start-Sleep -Seconds 3
+    }
+}
+
+# ---------------------------
+# Discover candidate certificates (your original flow continues here)
+# ---------------------------
+Write-Host "Searching for certificates with template: '$TemplateName' in LocalMachine\My ..."
+$now = Get-Date
+$certs = @(Get-ChildItem -Path Cert:\LocalMachine\My -ErrorAction SilentlyContinue)
+if (-not $certs -or $certs.Count -eq 0) {
+    Write-Host "❌ No certificates found in LocalMachine\My."
+    Write-RdpEvent -Id $EvtId_NoMatch -Type Warning -Message "No certificates found in LocalMachine\My."
+    #exit 1
+}
+
+# Filter by template name (via template info extension) and time validity
+$candidates = foreach ($c in $certs) {
+    # Find the template extension
+    $tmplExt = $c.Extensions | Where-Object { $_.Oid.Value -eq $TemplateExtOid -or $_.Oid.FriendlyName -eq "Certificate Template Information" }
+    if (-not $tmplExt) { continue }
+    $tmplText = $tmplExt.Format($false)
+    if ($tmplText -notlike "*$TemplateName*") { continue }
+    # Must be currently valid
+    if ($c.NotAfter -le $now -or $c.NotBefore -gt $now) { continue }
+    # Extract EKUs
+    $ekuExt = $c.Extensions | Where-Object { $_.Oid.Value -eq $EkuExtOid -or $_.Oid.FriendlyName -eq "Enhanced Key Usage" }
+    $ekuOids = @()
+    if ($ekuExt -and $ekuExt.PSObject.Properties.Name -contains 'EnhancedKeyUsages') {
+        $ekuOids = @($ekuExt.EnhancedKeyUsages | ForEach-Object { $_.Value })
+    }
+    # Ensure we can read HasPrivateKey smoothly
+    $hasKey = $false
+    try { $hasKey = [bool]$c.HasPrivateKey } catch { $hasKey = $false }
+    # Yield object with useful properties
+    [PSCustomObject]@{
+        Cert        = $c
+        Thumbprint  = ($c.Thumbprint -replace ' ', '').ToUpper()
+        Subject     = $c.Subject
+        Issuer      = $c.Issuer
+        NotBefore   = $c.NotBefore
+        NotAfter    = $c.NotAfter
+        EkuOids     = $ekuOids
+        HasPrivateKey = $hasKey
+        MatchesEKU  = ($RequiredEkuOids | ForEach-Object { $ekuOids -contains $_ }) -notcontains $false
+    }
+}
+if (-not $candidates -or $candidates.Count -eq 0) {
+    Write-Host "❌ No certificates found for template '$TemplateName'."
+    Write-RdpEvent -Id $EvtId_NoMatch -Type Warning -Message "No certificate found for template '$TemplateName'."
+    #exit 1
+}
+
+# Keep only candidates that have required EKUs and a private key
+$valid = $candidates | Where-Object { $_.MatchesEKU -and $_.HasPrivateKey }
+if (-not $valid -or $valid.Count -eq 0) {
+    Write-Host "❌ Found certificate(s) for template '$TemplateName' but none with required EKUs and a private key."
+    foreach ($c in $candidates) {
+        if (-not $c.MatchesEKU) { Write-Host (" - {0} missing required EKUs" -f $c.Thumbprint) }
+        if (-not $c.HasPrivateKey) { Write-Host (" - {0} missing private key" -f $c.Thumbprint) }
+    }
+    Write-RdpEvent -Id $EvtId_Invalid -Type Error -Message "Template '$TemplateName' found but no cert had required EKUs + private key."
+    #exit 2
+}
+
+if (-not $valid -or $valid.Count -eq 0) {
+    # No valid certificate exists yet — STOP here
+    Write-Host "No valid certificate available yet. Exiting so auto-enrollment can issue a new one."
+    return
+}
+
+# Select newest by expiration date
+$selected = $valid | Sort-Object -Property NotAfter -Descending | Select-Object -First 1
+$cert = $selected.Cert
+$thumb = $selected.Thumbprint
+
+# Build EKU display
+$ekuDisplay = @()
+$ekuExt = $cert.Extensions | Where-Object { $_.Oid.Value -eq $EkuExtOid -or $_.Oid.FriendlyName -eq "Enhanced Key Usage" }
+if ($ekuExt -and $ekuExt.PSObject.Properties.Name -contains 'EnhancedKeyUsages') {
+    $ekuDisplay = $ekuExt.EnhancedKeyUsages | ForEach-Object { "{0} ({1})" -f $_.FriendlyName, $_.Value }
+}
+
+# Output summary
+Write-Host "----------------------------------"
+Write-Host " Certificate Selected"
+Write-Host "----------------------------------"
+Write-Host "Subject: $($selected.Subject)"
+Write-Host "Issuer: $($selected.Issuer)"
+Write-Host "Thumbprint: $thumb"
+Write-Host "Expires: $($selected.NotAfter)"
+Write-Host "Template: $TemplateName"
+Write-Host ""
+Write-Host "Enhanced Key Usages (EKU):"
+foreach ($eku in $ekuDisplay) { Write-Host " - $eku" }
+Write-Host "----------------------------------"
+
+# Extra: warn if Client Authentication missing (optional)
+if ($OptionalEkuOids[0] -and ($selected.EkuOids -notcontains $OptionalEkuOids[0])) {
+    Write-Host "ℹ Note: Server Authentication EKU not present (optional)."
+}
+
+# -------------------------------
+# Check if certificate is already bound
+# -------------------------------
+$tsCurrent = Get-WmiObject -Class "Win32_TSGeneralSetting" `
+ -Namespace "root\cimv2\terminalservices" `
+ -Filter "TerminalName='RDP-Tcp'"
+
+$currentThumb = ($tsCurrent.SSLCertificateSHA1Hash -replace ' ', '').ToUpper()
+
+if ($currentThumb -eq $thumb) {
+    Write-Host "✔ Certificate already bound — no action required."
+    Write-RdpEvent -Id 1005 -Type Information -Message "No change: certificate $thumb is already bound. Script skipped."
+    return   # <-- REQUIRED, stops TestOnly falling through to binding
+}
+
+# ---------------------------
+# Test mode
+# ---------------------------
+if ($TestOnly) {
+    Write-Host "TEST MODE ENABLED — No binding will be performed."
+    Write-RdpEvent -Id $EvtId_Success -Type Information -Message "TestOnly: would bind RDP to $thumb (subject '$($selected.Subject)')."
+    return   # <-- REQUIRED, prevents real binding
+}
+
+# ---------------------------
+# Bind to RDP using WMI
+# ---------------------------
+try {
+    $ts = Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace "root\cimv2\terminalservices" -Filter "TerminalName='RDP-Tcp'"
+    if (-not $ts) { throw "WMI class Win32_TSGeneralSetting not found (RDP-Tcp)." }
+    $ts.SSLCertificateSHA1Hash = $thumb
+    $result = $ts.Put()
+    if ($result.ReturnValue -ne 0 -and $result.ReturnValue -ne $null) {
+        throw "WMI commit returned code $($result.ReturnValue)"
+    }
+    # Verify read-back
+    $ts2 = Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace "root\cimv2\terminalservices" -Filter "TerminalName='RDP-Tcp'"
+    $bound = ($ts2.SSLCertificateSHA1Hash -replace ' ', '').ToUpper()
+    if ($bound -ne $thumb) {
+        throw "Verification failed: read-back thumbprint '$bound' != expected '$thumb'."
+    }
+    Write-Host "✔ Certificate successfully bound to RDP."
+    Write-Host ""
+    Write-Host "NOTE: TermService was NOT restarted (GPO-safe)."
+    Write-Host " The new RDP certificate will become active the next time the server is restarted."
+    Write-RdpEvent -Id $EvtId_Success -Type Information -Message "RDP certificate $thumb bound successfully. Service restart skipped; will take effect after reboot."
+}
+catch {
+    $msg = "Binding failed: $($_.Exception.Message)"
+    Write-Error $msg
+    Write-RdpEvent -Id $EvtId_Invalid -Type Error -Message $msg
+    #exit 3
+}
+
+#exit 0

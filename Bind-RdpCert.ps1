@@ -27,6 +27,7 @@ param(
 # ---------------------------
 # Config
 # ---------------------------
+# Please change <Your RDP Template Name> to the name of your RDP Certificate.
 $TemplateName = "<Your RDP Template Name>"
 $TemplateExtOid = "1.3.6.1.4.1.311.21.7" # Certificate Template Information
 $EkuExtOid = "2.5.29.37" # EKU extension

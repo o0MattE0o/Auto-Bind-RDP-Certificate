@@ -153,6 +153,3 @@ Invalid certificates are excluded.
 * 
 ### ✅ Auditable
 * Writes all actions to Event Log
-
-
-If you want a more “CV / documentation style” version or a super short summary for change records, I can tailor that too 👍

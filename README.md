@@ -150,6 +150,6 @@ Invalid certificates are excluded.
 
 ### ✅ Safe cleanup logic
 * Never removes the active cert unless a replacement exists
-* 
+
 ### ✅ Auditable
 * Writes all actions to Event Log

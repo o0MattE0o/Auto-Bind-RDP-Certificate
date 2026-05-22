@@ -1,3 +1,66 @@
+## 🔧 Prerequisites
+For the script to function correctly, the environment must meet the following requirements:
+### 1. **Certificate Template Configuration**
+* A certificate template (e.g. **“RDP Authentication”**) must exist in Active Directory Certificate Services (AD CS)
+* The template must:
+  * Include the **Remote Desktop Authentication EKU**
+    * `1.3.6.1.4.1.311.54.1.2` (required)
+  * Optionally include **Server Authentication**
+    * `1.3.6.1.5.5.7.3.1` (recommended)
+  * Allow **private key export/use on the machine**
+  * Be configured for **computer accounts**
+***
+
+### 2. **Auto-Enrolment Enabled**
+* Group Policy must enable **certificate auto-enrollment** for computer objects:
+  * ✅ Automatically enroll certificates
+  * ✅ Renew expired certificates
+  * ✅ Update pending certificates
+Typical policy location:
+Computer Configuration  
+ → Policies  
+   → Windows Settings  
+     → Security Settings  
+       → Public Key Policies  
+         → Certificate Services Client – Auto-Enrollment
+***
+
+### 3. **Automatic Certificate Renewal**
+* The certificate template must be configured to:
+  * **Auto-renew before expiry**
+  * Have a reasonable validity period (e.g., 1 year)
+This ensures the script always has a **replacement certificate available**.
+***
+
+### 4. **Domain-Joined Machines**
+* Target systems must be:
+  * Joined to the domain
+  * Able to communicate with the **issuing Certificate Authority**
+***
+
+### 5. **Permissions**
+* The computer account must have:
+  * ✅ **Enroll** permission on the certificate template
+  * ✅ **Auto-enroll** permission (if using auto-enrollment)
+***
+
+### 6. **RDP Enabled**
+* Remote Desktop Services must be enabled:
+  * The script uses:
+    ```
+    Win32_TSGeneralSetting (RDP-Tcp)
+    ```
+  * RDP listener must exist on the system
+***
+
+### 7. **Administrative Privileges**
+* Script must run **elevated** to:
+  * Bind the certificate to RDP
+  * Modify registry (auto-enrollment policy)
+  * Remove invalid certificates
+***
+
+## Script
 This script automatically identifies, validates, and binds the most appropriate certificate for Remote Desktop Services (RDP), ensuring secure connectivity while maintaining compliance with certificate requirements—without disrupting the service.
 ***
 

@@ -1,3 +1,8 @@
+
+## Script
+This script automatically identifies, validates, and binds the most appropriate certificate for Remote Desktop Services (RDP), ensuring secure connectivity while maintaining compliance with certificate requirements—without disrupting the service.
+***
+
 ## 🔧 Prerequisites
 For the script to function correctly, the environment must meet the following requirements:
 ### 1. **Certificate Template Configuration**
@@ -58,10 +63,6 @@ This ensures the script always has a **replacement certificate available**.
   * Bind the certificate to RDP
   * Modify registry (auto-enrollment policy)
   * Remove invalid certificates
-***
-
-## Script
-This script automatically identifies, validates, and binds the most appropriate certificate for Remote Desktop Services (RDP), ensuring secure connectivity while maintaining compliance with certificate requirements—without disrupting the service.
 ***
 
 ## 🔄 Step-by-step process
